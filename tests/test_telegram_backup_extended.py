@@ -832,6 +832,7 @@ class TestSyncDeletionsAndEdits(unittest.TestCase):
         _run(self.backup._sync_deletions_and_edits(100, entity))
 
         self.backup.db.update_message_text.assert_awaited_once()
+        assert self.backup.db.update_message_text.call_args.kwargs["source"] == "sync_edit"
 
     def test_unedited_message_not_updated(self):
         """Message with no edit_date does not trigger update."""

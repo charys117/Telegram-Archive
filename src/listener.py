@@ -737,7 +737,11 @@ class TelegramListener:
 
                 # Apply the edit immediately
                 await self.db.update_message_text(
-                    chat_id=chat_id, message_id=message.id, new_text=new_text, edit_date=edit_date
+                    chat_id=chat_id,
+                    message_id=message.id,
+                    new_text=new_text,
+                    edit_date=edit_date,
+                    source="listener_edit",
                 )
                 self.stats["edits_applied"] += 1
                 logger.debug(f"📝 Edit applied: chat={chat_id} msg={message.id}")
@@ -918,7 +922,7 @@ class TelegramListener:
                     media_type = self._get_media_type(message.media)
 
                 # Insert the message FIRST (required for FK constraint on media table)
-                await self.db.insert_message(message_data)
+                await self.db.insert_message(message_data, source="listener_new")
                 self.stats["new_messages_saved"] += 1
 
                 # v6.0.0: Handle media - create Media record AFTER message exists
@@ -1077,7 +1081,7 @@ class TelegramListener:
                                 },
                                 "is_outgoing": 0,
                             }
-                            await self.db.insert_message(message_data)
+                            await self.db.insert_message(message_data, source="listener_service")
                             logger.info(f"📌 Service message saved: {service_text}")
                     except Exception as e:
                         logger.warning(f"Failed to save service message: {e}")

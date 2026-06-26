@@ -529,6 +529,7 @@ class TestEventHandlers:
             message_id=42,
             new_text="Updated text",
             edit_date=msg.edit_date,
+            source="listener_edit",
         )
 
     def test_on_message_edited_handles_none_text(self, listener_with_handlers):
