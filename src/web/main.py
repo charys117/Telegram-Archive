@@ -867,6 +867,11 @@ def _strip_original_media_paths(messages: list[dict]) -> None:
                     item["no_download"] = True
 
 
+def _export_chat_metadata(chat: dict) -> dict:
+    """Return the minimal chat metadata needed by JSON exports."""
+    return {key: chat.get(key) for key in ("id", "type", "title", "username")}
+
+
 # Setup paths
 templates_dir = Path(__file__).parent / "templates"
 static_dir = Path(__file__).parent / "static"
@@ -1467,6 +1472,27 @@ async def get_messages(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@app.get("/api/chats/{chat_id}/messages/{message_id}/versions")
+async def get_message_versions(
+    chat_id: int,
+    message_id: int,
+    user: UserContext = Depends(require_auth),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Get preserved previous versions for a message."""
+    user_chat_ids = get_user_chat_ids(user)
+    if user_chat_ids is not None and chat_id not in user_chat_ids:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    try:
+        return await db.get_message_versions(chat_id=chat_id, message_id=message_id, limit=limit)
+    except Exception as e:
+        logger.error(f"Error fetching message versions: {e}", exc_info=True)
+        if _is_db_connection_error(e):
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @app.get("/api/chats/{chat_id}/pinned")
 async def get_pinned_messages(chat_id: int, user: UserContext = Depends(require_auth)):
     """Get all pinned messages for a chat, ordered by date descending (newest first)."""
@@ -1951,17 +1977,22 @@ async def export_chat(chat_id: int, user: UserContext = Depends(require_auth)):
         # Sanitize filename
         safe_name = "".join(c for c in chat_name if c.isalnum() or c in (" ", "-", "_")).strip()
         filename = f"{safe_name}_export.json"
+        message_versions = await db.get_message_versions_by_date_range(chat_id=chat_id)
 
         async def iter_json():
-            yield "[\n"
+            yield "{\n"
+            yield f'  "chat": {json.dumps(_export_chat_metadata(chat), ensure_ascii=False, default=str)},\n'
+            yield '  "messages": [\n'
             first = True
             async for msg in db.get_messages_for_export(chat_id):
                 if not first:
                     yield ",\n"
                 first = False
                 # Ensure UTF-8 encoding for non-Latin characters
-                yield json.dumps(msg, ensure_ascii=False)
-            yield "\n]"
+                yield "    " + json.dumps(msg, ensure_ascii=False, default=str)
+            yield "\n  ],\n"
+            yield ('  "message_versions": ' + json.dumps(message_versions, ensure_ascii=False, default=str) + "\n")
+            yield "}"
 
         # RFC 5987 encoding for non-ASCII filenames
         encoded_filename = quote(filename)

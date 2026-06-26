@@ -31,6 +31,7 @@ from .models import (
     ForumTopic,
     Media,
     Message,
+    MessageVersion,
     Metadata,
     Reaction,
     SyncStatus,
@@ -62,8 +63,43 @@ def _message_conflict_update_values(message_data: dict[str, Any], values: dict[s
         update_values.pop("deleted_at", None)
     elif "deleted_at" not in message_data:
         update_values.pop("deleted_at", None)
+    if "is_pinned" not in message_data:
+        update_values.pop("is_pinned", None)
 
     return update_values
+
+
+def _datetime_hash_value(dt: datetime | None) -> str | None:
+    dt = _strip_tz(dt)
+    if dt is None:
+        return None
+    return dt.isoformat(timespec="microseconds")
+
+
+def _message_version_hash(
+    chat_id: int,
+    message_id: int,
+    text: str | None,
+    date: datetime,
+) -> str:
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "date": _datetime_hash_value(date),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _newer_edit_date(current: datetime | None, incoming: datetime | None) -> bool:
+    current = _strip_tz(current)
+    incoming = _strip_tz(incoming)
+    if incoming is None:
+        return False
+    if current is None:
+        return True
+    return incoming > current
 
 
 def retry_on_locked(
@@ -160,6 +196,158 @@ class DatabaseAdapter:
             except Exception as e2:
                 logger.error(f"Failed to serialize raw_data even after conversion: {e2}")
                 return "{}"
+
+    def _message_values(self, message_data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": message_data["id"],
+            "chat_id": message_data["chat_id"],
+            "sender_id": message_data.get("sender_id"),
+            "date": _strip_tz(message_data["date"]),
+            "text": message_data.get("text"),
+            "reply_to_msg_id": message_data.get("reply_to_msg_id"),
+            "reply_to_top_id": message_data.get("reply_to_top_id"),
+            "reply_to_text": message_data.get("reply_to_text"),
+            "forward_from_id": message_data.get("forward_from_id"),
+            "edit_date": _strip_tz(message_data.get("edit_date")),
+            "raw_data": self._serialize_raw_data(message_data.get("raw_data", {})),
+            "is_outgoing": message_data.get("is_outgoing", 0),
+            "is_pinned": message_data.get("is_pinned", 0),
+            "is_deleted": message_data.get("is_deleted", 0),
+            "deleted_at": _strip_tz(message_data.get("deleted_at")),
+        }
+
+    def _insert_message_stmt(self, values: dict[str, Any]):
+        if self._is_sqlite:
+            return sqlite_insert(Message).values(**values).on_conflict_do_nothing(index_elements=["id", "chat_id"])
+        return pg_insert(Message).values(**values).on_conflict_do_nothing(index_elements=["id", "chat_id"])
+
+    def _insert_message_version_stmt(self, values: dict[str, Any]):
+        if self._is_sqlite:
+            return sqlite_insert(MessageVersion).values(**values).on_conflict_do_nothing(index_elements=["change_hash"])
+        return pg_insert(MessageVersion).values(**values).on_conflict_do_nothing(index_elements=["change_hash"])
+
+    async def _record_message_version(
+        self,
+        session,
+        chat_id: int,
+        message_id: int,
+        text: str | None,
+        date: datetime,
+    ) -> bool:
+        date = _strip_tz(date)
+        if date is None:
+            return False
+
+        change_hash = _message_version_hash(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            date=date,
+        )
+        values = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "date": date,
+            "change_hash": change_hash,
+            "captured_at": utcnow_naive(),
+        }
+        result = await session.execute(self._insert_message_version_stmt(values))
+        return bool(result.rowcount)
+
+    def _message_version_date(self, message: Message) -> datetime:
+        return _strip_tz(message.edit_date) or _strip_tz(message.date)
+
+    def _should_apply_upsert_text(self, existing: Message, values: dict[str, Any]) -> bool:
+        new_text = values.get("text")
+        new_edit_date = _strip_tz(values.get("edit_date"))
+        old_text = existing.text
+        old_edit_date = _strip_tz(existing.edit_date)
+
+        if old_text == new_text:
+            return _newer_edit_date(old_edit_date, new_edit_date)
+        if (old_text is None or old_text == "") and new_text not in (None, ""):
+            return True
+        if new_edit_date is None:
+            return False
+        if old_edit_date is None:
+            return True
+        if new_edit_date >= old_edit_date:
+            return True
+        return False
+
+    def _should_apply_edit_text(self, existing: Message, new_text: str, edit_date: datetime | None) -> bool:
+        old_edit_date = _strip_tz(existing.edit_date)
+        edit_date = _strip_tz(edit_date)
+
+        if existing.text == new_text and old_edit_date == edit_date:
+            return False
+        if edit_date is None:
+            return old_edit_date is None
+        if old_edit_date is None:
+            return True
+        return edit_date >= old_edit_date
+
+    async def _load_message_for_update(self, session, chat_id: int, message_id: int) -> Message | None:
+        if self._is_sqlite:
+            # SQLite has no row-level SELECT FOR UPDATE. A no-op write acquires the
+            # transaction's write lock before we re-read and decide whether to update.
+            await session.execute(
+                update(Message).where(and_(Message.chat_id == chat_id, Message.id == message_id)).values(id=Message.id)
+            )
+            stmt = select(Message).where(and_(Message.chat_id == chat_id, Message.id == message_id))
+        else:
+            stmt = select(Message).where(and_(Message.chat_id == chat_id, Message.id == message_id)).with_for_update()
+
+        result = await session.execute(stmt.execution_options(populate_existing=True))
+        return result.scalar_one_or_none()
+
+    async def _apply_existing_message_update(
+        self,
+        session,
+        message_data: dict[str, Any],
+        values: dict[str, Any],
+        source: str,
+    ) -> None:
+        existing = await self._load_message_for_update(session, values["chat_id"], values["id"])
+        if existing is None:
+            return
+
+        update_values = _message_conflict_update_values(message_data, values)
+        apply_text = self._should_apply_upsert_text(existing, values)
+        new_edit_date = values.get("edit_date")
+        if apply_text and new_edit_date is None and existing.edit_date is not None:
+            update_values.pop("edit_date", None)
+            new_edit_date = existing.edit_date
+
+        if apply_text:
+            if existing.text != values.get("text"):
+                await self._record_message_version(
+                    session=session,
+                    chat_id=existing.chat_id,
+                    message_id=existing.id,
+                    text=existing.text,
+                    date=self._message_version_date(existing),
+                )
+            else:
+                update_values.pop("text", None)
+        else:
+            update_values.pop("text", None)
+            update_values.pop("edit_date", None)
+
+        await session.execute(
+            update(Message)
+            .where(and_(Message.chat_id == values["chat_id"], Message.id == values["id"]))
+            .values(**update_values)
+        )
+
+    async def _insert_or_update_message(self, session, message_data: dict[str, Any], source: str) -> None:
+        values = self._message_values(message_data)
+        result = await session.execute(self._insert_message_stmt(values))
+        if result.rowcount:
+            return
+
+        await self._apply_existing_message_update(session, message_data, values, source)
 
     # ========== Metadata Operations ==========
 
@@ -411,42 +599,17 @@ class DatabaseAdapter:
 
     # ========== Message Operations ==========
 
-    async def insert_message(self, message_data: dict[str, Any]) -> None:
+    async def insert_message(self, message_data: dict[str, Any], source: str = "upsert") -> None:
         """Insert a message record.
 
         v6.0.0: media_type, media_id, media_path removed - use insert_media() separately.
         """
         async with self.db_manager.async_session_factory() as session:
-            values = {
-                "id": message_data["id"],
-                "chat_id": message_data["chat_id"],
-                "sender_id": message_data.get("sender_id"),
-                "date": _strip_tz(message_data["date"]),
-                "text": message_data.get("text"),
-                "reply_to_msg_id": message_data.get("reply_to_msg_id"),
-                "reply_to_top_id": message_data.get("reply_to_top_id"),
-                "reply_to_text": message_data.get("reply_to_text"),
-                "forward_from_id": message_data.get("forward_from_id"),
-                "edit_date": _strip_tz(message_data.get("edit_date")),
-                "raw_data": self._serialize_raw_data(message_data.get("raw_data", {})),
-                "is_outgoing": message_data.get("is_outgoing", 0),
-                "is_deleted": message_data.get("is_deleted", 0),
-                "deleted_at": _strip_tz(message_data.get("deleted_at")),
-            }
-            update_values = _message_conflict_update_values(message_data, values)
-
-            if self._is_sqlite:
-                stmt = sqlite_insert(Message).values(**values)
-                stmt = stmt.on_conflict_do_update(index_elements=["id", "chat_id"], set_=update_values)
-            else:
-                stmt = pg_insert(Message).values(**values)
-                stmt = stmt.on_conflict_do_update(index_elements=["id", "chat_id"], set_=update_values)
-
-            await session.execute(stmt)
+            await self._insert_or_update_message(session, message_data, source)
             await session.commit()
 
     @retry_on_locked()
-    async def insert_messages_batch(self, messages_data: list[dict[str, Any]]) -> None:
+    async def insert_messages_batch(self, messages_data: list[dict[str, Any]], source: str = "upsert") -> None:
         """Insert multiple message records in a single transaction.
 
         v6.0.0: media_type, media_id, media_path removed - use insert_media() separately.
@@ -456,33 +619,7 @@ class DatabaseAdapter:
 
         async with self.db_manager.async_session_factory() as session:
             for m in messages_data:
-                values = {
-                    "id": m["id"],
-                    "chat_id": m["chat_id"],
-                    "sender_id": m.get("sender_id"),
-                    "date": _strip_tz(m["date"]),
-                    "text": m.get("text"),
-                    "reply_to_msg_id": m.get("reply_to_msg_id"),
-                    "reply_to_top_id": m.get("reply_to_top_id"),
-                    "reply_to_text": m.get("reply_to_text"),
-                    "forward_from_id": m.get("forward_from_id"),
-                    "edit_date": _strip_tz(m.get("edit_date")),
-                    "raw_data": self._serialize_raw_data(m.get("raw_data", {})),
-                    "is_outgoing": m.get("is_outgoing", 0),
-                    "is_pinned": m.get("is_pinned", 0),
-                    "is_deleted": m.get("is_deleted", 0),
-                    "deleted_at": _strip_tz(m.get("deleted_at")),
-                }
-                update_values = _message_conflict_update_values(m, values)
-
-                if self._is_sqlite:
-                    stmt = sqlite_insert(Message).values(**values)
-                    stmt = stmt.on_conflict_do_update(index_elements=["id", "chat_id"], set_=update_values)
-                else:
-                    stmt = pg_insert(Message).values(**values)
-                    stmt = stmt.on_conflict_do_update(index_elements=["id", "chat_id"], set_=update_values)
-
-                await session.execute(stmt)
+                await self._insert_or_update_message(session, m, source)
 
             await session.commit()
 
@@ -551,6 +688,12 @@ class DatabaseAdapter:
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         """Delete a specific message and its media."""
         async with self.db_manager.async_session_factory() as session:
+            # Delete previous versions
+            await session.execute(
+                delete(MessageVersion).where(
+                    and_(MessageVersion.chat_id == chat_id, MessageVersion.message_id == message_id)
+                )
+            )
             # Delete associated media
             await session.execute(delete(Media).where(and_(Media.chat_id == chat_id, Media.message_id == message_id)))
             # Delete reactions
@@ -600,14 +743,32 @@ class DatabaseAdapter:
             return None
 
     async def update_message_text(
-        self, chat_id: int, message_id: int, new_text: str, edit_date: datetime | None
+        self, chat_id: int, message_id: int, new_text: str, edit_date: datetime | None, source: str = "edit"
     ) -> None:
         """Update a message's text and edit_date."""
+        edit_date = _strip_tz(edit_date)
         async with self.db_manager.async_session_factory() as session:
+            message = await self._load_message_for_update(session, chat_id, message_id)
+            if message is None:
+                logger.debug(f"Edit no-op: message {message_id} not found in chat {chat_id}")
+                return
+
+            if not self._should_apply_edit_text(message, new_text, edit_date):
+                logger.debug(f"Edit no-op: message {message_id} in chat {chat_id} already current")
+                return
+
+            if message.text != new_text:
+                await self._record_message_version(
+                    session=session,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=message.text,
+                    date=self._message_version_date(message),
+                )
             await session.execute(
                 update(Message)
                 .where(and_(Message.chat_id == chat_id, Message.id == message_id))
-                .values(text=new_text, edit_date=_strip_tz(edit_date))
+                .values(text=new_text, edit_date=edit_date)
             )
             await session.commit()
             logger.debug(f"Updated message {message_id} in chat {chat_id}")
@@ -656,6 +817,58 @@ class DatabaseAdapter:
             "is_deleted": int(is_deleted),
             "deleted_at": deleted_at,
         }
+
+    def _message_version_to_dict(self, row: MessageVersion) -> dict[str, Any]:
+        return {
+            "chat_id": row.chat_id,
+            "message_id": row.message_id,
+            "text": row.text,
+            "date": row.date,
+        }
+
+    async def get_message_versions(self, chat_id: int, message_id: int, limit: int = 100) -> list[dict[str, Any]]:
+        """Get preserved previous text versions for a message."""
+        async with self.db_manager.async_session_factory() as session:
+            stmt = (
+                select(MessageVersion)
+                .where(and_(MessageVersion.chat_id == chat_id, MessageVersion.message_id == message_id))
+                .order_by(MessageVersion.date.desc(), MessageVersion.id.desc())
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            return [self._message_version_to_dict(row) for row in result.scalars()]
+
+    async def get_message_versions_by_date_range(
+        self,
+        chat_id: int | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get previous message versions by version date/chat filter."""
+        async with self.db_manager.async_session_factory() as session:
+            stmt = select(MessageVersion).join(
+                Message,
+                and_(MessageVersion.message_id == Message.id, MessageVersion.chat_id == Message.chat_id),
+            )
+
+            conditions = []
+            if chat_id:
+                conditions.append(MessageVersion.chat_id == chat_id)
+            if start_date:
+                conditions.append(MessageVersion.date >= start_date)
+            if end_date:
+                conditions.append(MessageVersion.date <= end_date)
+            if conditions:
+                stmt = stmt.where(and_(*conditions))
+
+            stmt = stmt.order_by(
+                MessageVersion.chat_id.asc(),
+                MessageVersion.message_id.asc(),
+                MessageVersion.date.asc(),
+                MessageVersion.id.asc(),
+            )
+            result = await session.execute(stmt)
+            return [self._message_version_to_dict(row) for row in result.scalars()]
 
     async def get_chat_stats(self, chat_id: int) -> dict[str, Any]:
         """Get statistics for a specific chat (message count, media count, total size).
@@ -1257,6 +1470,8 @@ class DatabaseAdapter:
     async def delete_chat_and_related_data(self, chat_id: int, media_base_path: str = None) -> None:
         """Delete a chat and all related data."""
         async with self.db_manager.async_session_factory() as session:
+            # Delete previous versions
+            await session.execute(delete(MessageVersion).where(MessageVersion.chat_id == chat_id))
             # Delete media records
             await session.execute(delete(Media).where(Media.chat_id == chat_id))
             # Delete reactions
@@ -1411,8 +1626,26 @@ class DatabaseAdapter:
 
                 messages.append(msg)
 
+            version_counts = {msg["id"]: 0 for msg in messages}
+            version_count_message_ids = [msg["id"] for msg in messages if msg.get("edit_date")]
+            if version_count_message_ids:
+                count_stmt = (
+                    select(MessageVersion.message_id, func.count(MessageVersion.id).label("version_count"))
+                    .where(
+                        and_(
+                            MessageVersion.chat_id == chat_id,
+                            MessageVersion.message_id.in_(version_count_message_ids),
+                        )
+                    )
+                    .group_by(MessageVersion.message_id)
+                )
+                count_result = await session.execute(count_stmt)
+                version_counts.update({row.message_id: int(row.version_count or 0) for row in count_result})
+
             # Get reply texts and reactions for each message
             for msg in messages:
+                msg["version_count"] = version_counts.get(msg["id"], 0)
+
                 if msg.get("reply_to_msg_id") and not msg.get("reply_to_text"):
                     reply_result = await session.execute(
                         select(Message.text).where(

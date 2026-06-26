@@ -1137,9 +1137,9 @@ class TelegramBackup:
 
         return grand_total
 
-    async def _commit_batch(self, batch_data: list[dict], chat_id: int) -> None:
+    async def _commit_batch(self, batch_data: list[dict], chat_id: int, source: str = "backup_upsert") -> None:
         """Persist a batch of processed messages, their media and reactions to the DB."""
-        await self.db.insert_messages_batch(batch_data)
+        await self.db.insert_messages_batch(batch_data, source=source)
 
         for msg in batch_data:
             if msg.get("_media_data"):
@@ -1190,13 +1190,13 @@ class TelegramBackup:
             batch_data.append(msg_data)
 
             if len(batch_data) >= batch_size:
-                await self._commit_batch(batch_data, chat_id)
+                await self._commit_batch(batch_data, chat_id, source="gap_fill")
                 recovered += len(batch_data)
                 batch_data = []
 
         # Flush remaining messages
         if batch_data:
-            await self._commit_batch(batch_data, chat_id)
+            await self._commit_batch(batch_data, chat_id, source="gap_fill")
             recovered += len(batch_data)
 
         return recovered
@@ -1360,7 +1360,9 @@ class TelegramBackup:
 
                     if should_update:
                         # Update text and edit_date
-                        await self.db.update_message_text(chat_id, msg_id, remote_msg.message, remote_msg.edit_date)
+                        await self.db.update_message_text(
+                            chat_id, msg_id, remote_msg.message, remote_msg.edit_date, source="sync_edit"
+                        )
                         total_updated += 1
 
             except Exception as e:
