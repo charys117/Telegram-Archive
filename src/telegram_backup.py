@@ -86,6 +86,7 @@ MEDIA_REFRESH_RPC_MESSAGES = frozenset({LOCATION_NOT_AVAILABLE})
 
 
 def _rpc_error_matches(exc: Exception, messages: frozenset[str] | set[str]) -> bool:
+    """Return whether a Telethon RPCError carries one of the given message codes."""
     if not isinstance(exc, RPCError):
         return False
 
@@ -99,6 +100,7 @@ def _rpc_error_matches(exc: Exception, messages: frozenset[str] | set[str]) -> b
 
 
 def _is_location_not_available_error(exc: Exception) -> bool:
+    """Return whether Telegram reported an unavailable media file location."""
     return _rpc_error_matches(exc, MEDIA_REFRESH_RPC_MESSAGES)
 
 
@@ -1732,6 +1734,7 @@ class TelegramBackup:
             logger.error(f"Error cleaning up existing media for chat {chat_id}: {e}", exc_info=True)
 
     async def _refresh_message_for_media(self, chat_id: int, message: Message) -> Message | None:
+        """Fetch a fresh message so Telegram can issue updated media file references."""
         fresh_messages = await call_with_flood_retry(self.client.get_messages, chat_id, ids=[message.id])
         if fresh_messages and fresh_messages[0]:
             return fresh_messages[0]
@@ -1840,10 +1843,7 @@ class TelegramBackup:
                             if not _is_location_not_available_error(e):
                                 raise
                             logger.info(
-                                "Media location unavailable for chat %s message %s; refreshing before retry "
-                                "(attempt %d/3)",
-                                chat_id,
-                                message.id,
+                                "Media location unavailable; refreshing before retry (attempt %d/3)",
                                 attempt + 1,
                             )
                             if attempt == 2:
@@ -1917,10 +1917,7 @@ class TelegramBackup:
                             if not _is_location_not_available_error(e):
                                 raise
                             logger.info(
-                                "Media location unavailable for chat %s message %s; refreshing before retry "
-                                "(attempt %d/3)",
-                                chat_id,
-                                message.id,
+                                "Media location unavailable; refreshing before retry (attempt %d/3)",
                                 attempt + 1,
                             )
                             if attempt == 2:
