@@ -101,6 +101,17 @@ def _media_retry_backoff_seconds(attempt: int) -> float:
     return base + random.uniform(0.5, 1.5)
 
 
+def _is_non_retryable_media_op(exc: BaseException) -> bool:
+    """Errors the media-download loop handles itself, so ``call_with_flood_retry``
+    must re-raise them rather than retry: location errors (the outer loop refreshes
+    and backs off) and a per-operation ``TimeoutError`` (the outer loop decides).
+
+    Keeping these out of ``call_with_flood_retry`` also means the per-operation
+    timeout never wraps — and so never cancels — its FloodWait sleeps.
+    """
+    return is_media_location_error(exc) or isinstance(exc, TimeoutError)
+
+
 def _pre_generate_thumbnail(source_path: str, media_root: str) -> None:
     """Pre-generate 200px WebP thumbnail for gallery grid view."""
     try:
@@ -1745,10 +1756,19 @@ class TelegramBackup:
         blows up the surrounding retry loop. Handles a deleted/unavailable
         message (``[]`` or ``[None]``) by returning ``None``.
         """
-        try:
-            fresh_messages = await asyncio.wait_for(
-                call_with_flood_retry(self.client.get_messages, chat_id, ids=[message.id]),
+
+        async def _get_messages_once():
+            # Time only the single Telegram call, so call_with_flood_retry still
+            # owns (and is never cancelled mid-) any FloodWait sleep.
+            return await asyncio.wait_for(
+                self.client.get_messages(chat_id, ids=[message.id]),
                 timeout=MEDIA_REFRESH_TIMEOUT_SECONDS,
+            )
+
+        try:
+            fresh_messages = await call_with_flood_retry(
+                _get_messages_once,
+                non_retryable=lambda exc: isinstance(exc, TimeoutError),
             )
         except (TimeoutError, RPCError, ConnectionError, OSError) as e:
             logger.debug("Could not refresh media reference (%s)", type(e).__name__)
@@ -1756,6 +1776,20 @@ class TelegramBackup:
         if fresh_messages and fresh_messages[0]:
             return fresh_messages[0]
         return None
+
+    async def _fetch_media_bytes_bounded(self, message: Message, tmp_path: str, file_size: int, timeout_val):
+        """``_fetch_media_bytes`` bounded by a per-operation timeout.
+
+        Timing only the single download operation (rather than the whole
+        ``call_with_flood_retry`` wrapper) ensures a Telegram FloodWait sleep is
+        never cancelled by the download timeout. A timed-out operation raises
+        ``TimeoutError``, which ``_is_non_retryable_media_op`` lets propagate to
+        the outer retry loop.
+        """
+        coro = self._fetch_media_bytes(message, tmp_path, file_size)
+        if timeout_val is None:
+            return await coro
+        return await asyncio.wait_for(coro, timeout=timeout_val)
 
     async def _download_media_to_path(self, message: Message, tmp_path: str, file_size: int, chat_id: int):
         """Download a message's media to ``tmp_path`` with bounded refresh + retry.
@@ -1780,15 +1814,13 @@ class TelegramBackup:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
                 try:
-                    return await asyncio.wait_for(
-                        call_with_flood_retry(
-                            self._fetch_media_bytes,
-                            message,
-                            tmp_path,
-                            file_size,
-                            non_retryable=is_media_location_error,
-                        ),
-                        timeout=timeout_val,
+                    return await call_with_flood_retry(
+                        self._fetch_media_bytes_bounded,
+                        message,
+                        tmp_path,
+                        file_size,
+                        timeout_val,
+                        non_retryable=_is_non_retryable_media_op,
                     )
                 except (FileReferenceExpiredError, RPCError) as e:
                     is_expired_ref = isinstance(e, FileReferenceExpiredError)
@@ -1804,11 +1836,17 @@ class TelegramBackup:
                     refreshed = await self._refresh_message_for_media(chat_id, message)
                     if refreshed is not None:
                         message = refreshed
-                    logger.info(
-                        "Refreshed media reference after a transient error (attempt %d/%d); retrying",
-                        attempt + 1,
-                        MEDIA_REFRESH_MAX_ATTEMPTS,
-                    )
+                        logger.info(
+                            "Refreshed media reference after a transient error (attempt %d/%d); retrying",
+                            attempt + 1,
+                            MEDIA_REFRESH_MAX_ATTEMPTS,
+                        )
+                    else:
+                        logger.info(
+                            "Could not refresh media reference (attempt %d/%d); retrying anyway",
+                            attempt + 1,
+                            MEDIA_REFRESH_MAX_ATTEMPTS,
+                        )
                     if not is_expired_ref:
                         await asyncio.sleep(_media_retry_backoff_seconds(attempt))
                 except TimeoutError:

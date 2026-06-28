@@ -1648,6 +1648,34 @@ class TestMediaRefreshErrorHelpers(unittest.TestCase):
             # Best-effort refresh: must return None rather than raising.
             self.assertIsNone(_run(backup._refresh_message_for_media(100, _make_message(11))))
 
+    def test_media_retry_backoff_seconds_grows_and_is_bounded(self):
+        """Backoff grows with the attempt and stays under the configured ceiling (+jitter)."""
+        self.assertGreater(
+            telegram_backup._media_retry_backoff_seconds(1),
+            telegram_backup._media_retry_backoff_seconds(0),
+        )
+        big = telegram_backup._media_retry_backoff_seconds(100)
+        self.assertLessEqual(big, telegram_backup.BACKOFF_MAX_SECONDS + 1.5)
+
+    def test_is_non_retryable_media_op(self):
+        """Location errors and per-operation timeouts bypass call_with_flood_retry's retries."""
+        self.assertTrue(
+            telegram_backup._is_non_retryable_media_op(BadRequestError(MagicMock(), "LOCATION_NOT_AVAILABLE", 400))
+        )
+        self.assertTrue(telegram_backup._is_non_retryable_media_op(TimeoutError()))
+        self.assertFalse(telegram_backup._is_non_retryable_media_op(BadRequestError(MagicMock(), "MEDIA_EMPTY", 400)))
+
+    def test_fetch_media_bytes_bounded_times_out_only_the_operation(self):
+        """The per-operation timeout bounds a slow download and raises TimeoutError."""
+        backup = _make_backup()
+
+        async def slow_fetch(message, path, size):
+            await asyncio.sleep(1)
+
+        backup._fetch_media_bytes = AsyncMock(side_effect=slow_fetch)
+        with self.assertRaises(TimeoutError):
+            _run(backup._fetch_media_bytes_bounded(_make_message(1), "/tmp/unused", 100, 0.01))
+
 
 # ===========================================================================
 # _process_media (lines 1420-1427, 1433-1435)
@@ -2108,6 +2136,56 @@ class TestProcessMedia(unittest.TestCase):
 
         self.assertEqual(result, tmp_path)
         self.assertEqual(fetched, [msg, fresh_msg])
+
+    def test_download_media_to_path_retries_then_succeeds_after_timeout(self):
+        """A per-operation timeout is retried by the outer loop, then succeeds."""
+        msg = self._make_photo_message(25)
+        calls = []
+
+        async def fake_fetch(message, path, size):
+            calls.append(message)
+            if len(calls) == 1:
+                raise TimeoutError()
+            with open(path, "wb") as f:
+                f.write(b"x")
+            return path
+
+        self.backup._fetch_media_bytes = AsyncMock(side_effect=fake_fetch)
+        tmp_path = os.path.join(self.temp_dir, "timeout_ok.part")
+
+        result = _run(self.backup._download_media_to_path(msg, tmp_path, 100, 100))
+
+        self.assertEqual(result, tmp_path)
+        self.assertEqual(len(calls), 2)
+
+    def test_download_media_to_path_gives_up_after_persistent_timeout(self):
+        """Persistent per-operation timeouts exhaust attempts and raise TimeoutError."""
+        msg = self._make_photo_message(26)
+        self.backup._fetch_media_bytes = AsyncMock(side_effect=TimeoutError())
+        tmp_path = os.path.join(self.temp_dir, "timeout_fail.part")
+
+        with self.assertRaises(TimeoutError):
+            _run(self.backup._download_media_to_path(msg, tmp_path, 100, 100))
+
+        self.assertEqual(self.backup._fetch_media_bytes.await_count, 3)
+
+    def test_download_media_to_path_cleans_partial_on_failure(self):
+        """A partial .part written before a failure is removed (no orphan left behind)."""
+        msg = self._make_photo_message(27)
+        self.backup.client.get_messages = AsyncMock(return_value=[None])
+
+        async def fake_fetch(message, path, size):
+            with open(path, "wb") as f:
+                f.write(b"partial")
+            raise BadRequestError(MagicMock(), "LOCATION_NOT_AVAILABLE", 400)
+
+        self.backup._fetch_media_bytes = AsyncMock(side_effect=fake_fetch)
+        tmp_path = os.path.join(self.temp_dir, "cleanup.part")
+
+        with self.assertRaises(BadRequestError):
+            _run(self.backup._download_media_to_path(msg, tmp_path, 100, 100))
+
+        self.assertFalse(os.path.exists(tmp_path))
 
 
 # ===========================================================================
