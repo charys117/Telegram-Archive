@@ -3587,6 +3587,7 @@
                                 return
                             }
                             if (res.status === 503) {
+                                if (messageVersionsRequestSeq.value[key] !== requestSeq) return
                                 setMessageVersionsRecord(messageVersionsErrors, key, 'Database temporarily unavailable')
                                 return
                             }

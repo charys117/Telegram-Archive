@@ -76,7 +76,8 @@ def test_message_versions_ignore_stale_load_responses():
     assert "const messageVersionsRequestSeq = ref({})" in html
     assert "const requestSeq = (messageVersionsRequestSeq.value[key] || 0) + 1" in html
     assert "setMessageVersionsRecord(messageVersionsRequestSeq, key, requestSeq)" in html
-    assert html.count("messageVersionsRequestSeq.value[key] !== requestSeq") == 2
+    # success, catch, AND the 503 branch must all discard stale responses
+    assert html.count("messageVersionsRequestSeq.value[key] !== requestSeq") == 3
     assert "if (messageVersionsRequestSeq.value[key] === requestSeq)" in html
 
 
